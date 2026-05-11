@@ -1,4 +1,4 @@
-# Matrix Multiplication — CUDA Benchmark
+# Matrix Multiplication — CUDA Benchmark 🚀
 
 A step-by-step CUDA matrix multiplication benchmark that compares four implementations:
 
@@ -11,7 +11,7 @@ The goal of this project is to understand CUDA performance progression: start wi
 
 ---
 
-## Overview
+## Overview 📌
 
 Matrix multiplication is a classic GPU workload because it combines:
 
@@ -36,7 +36,7 @@ The benchmark reports execution time and GFLOPS for each implementation.
 
 ---
 
-## Implementations
+## Implementations 🧩
 
 | Implementation | Description |
 |---|---|
@@ -47,22 +47,22 @@ The benchmark reports execution time and GFLOPS for each implementation.
 
 ---
 
-## Current Status
+## Current Status ✅
 
 Implemented:
 
-- CPU matrix multiplication reference
-- Naive CUDA matrix multiplication kernel
-- Tiled CUDA shared-memory kernel
-- cuBLAS `cublasSgemm` benchmark
-- Correctness verification against CPU output
-- CUDA event timing
-- GFLOPS calculation
-- Benchmark results for `N = 256`, `512`, and `1024`
+- ✅ CPU matrix multiplication reference
+- ✅ Naive CUDA matrix multiplication kernel
+- ✅ Tiled CUDA shared-memory kernel
+- ✅ cuBLAS `cublasSgemm` benchmark
+- ✅ Correctness verification against CPU output
+- ✅ CUDA event timing
+- ✅ GFLOPS calculation
+- ✅ Benchmark results for `N = 256`, `512`, and `1024`
 
 ---
 
-## Build
+## Build 🛠️
 
 Build from the repository root:
 
@@ -89,7 +89,7 @@ nvcc -O2 -std=c++14 -Iinclude \
 
 ---
 
-## Run
+## Run ▶️
 
 Run from the repository root:
 
@@ -108,7 +108,7 @@ cuBLAS          256     ...
 
 ---
 
-## WSL CUDA Note
+## WSL CUDA Note 🐧
 
 When running inside WSL, the CUDA driver library may need to be visible through `LD_LIBRARY_PATH`.
 
@@ -139,7 +139,7 @@ source ~/.bashrc
 
 ---
 
-## Clean
+## Clean 🧹
 
 Remove the generated binary:
 
@@ -149,7 +149,7 @@ make clean
 
 ---
 
-## Project Layout
+## Project Layout 📁
 
 ```text
 .
@@ -173,7 +173,7 @@ make clean
 
 ---
 
-## Source Files
+## Source Files 🗂️
 
 | File | Purpose |
 |---|---|
@@ -185,7 +185,7 @@ make clean
 
 ---
 
-## GFLOPS Formula
+## GFLOPS Formula 📐
 
 For square matrix multiplication:
 
@@ -213,9 +213,9 @@ GFLOPS = (2 * N^3) / (time_seconds * 1e9)
 
 ---
 
-## Kernel Details
+## Kernel Details ⚙️
 
-### Naive CUDA Kernel
+### Naive CUDA Kernel 🧱
 
 Each CUDA thread computes one element of `C`:
 
@@ -229,7 +229,7 @@ It is simple and correct, but not highly optimized because many threads repeated
 
 ---
 
-### Tiled Shared-Memory Kernel
+### Tiled Shared-Memory Kernel 🧠
 
 The tiled kernel divides the input matrices into `TILE_SIZE x TILE_SIZE` blocks.
 
@@ -252,7 +252,7 @@ Current tile size:
 
 ---
 
-### cuBLAS
+### cuBLAS ⚡
 
 cuBLAS is NVIDIA's highly optimized BLAS library.
 
@@ -266,7 +266,7 @@ Because cuBLAS assumes column-major matrix layout, while this project stores mat
 
 ---
 
-## Latest Results
+## Latest Results 📊
 
 Hardware:
 
@@ -294,7 +294,7 @@ Latest documented run:
 
 ---
 
-## Performance Summary
+## Performance Summary 🚄
 
 For `N = 512`:
 
@@ -312,7 +312,7 @@ For `N = 1024`, cuBLAS is still faster than the tiled kernel, but the measured r
 
 ---
 
-## Correctness
+## Correctness ✅
 
 Matrices are currently initialized with:
 
@@ -339,7 +339,7 @@ cuBLAS: PASSED
 
 ---
 
-## Notes
+## Notes 📝
 
 - Timing uses CUDA events.
 - `cudaMalloc`, host-device copies, setup, and cleanup are not included in GPU timing.
@@ -350,27 +350,27 @@ cuBLAS: PASSED
 
 ---
 
-## Future Work
+## Future Work 🔭
 
 Planned improvements:
 
-- Compute CPU reference only once per matrix size.
-- Add speedup vs Naive CUDA directly in the output table.
-- Add command-line arguments:
+- 🔧 Compute CPU reference only once per matrix size.
+- 🔧 Add speedup vs Naive CUDA directly in the output table.
+- 🔧 Add command-line arguments:
   - `--size`
   - `--iterations`
   - `--tile-size`
   - `--implementation`
-- Add CSV export.
-- Add Nsight Compute profiling notes.
-- Compare tile sizes `16 x 16` and `32 x 32` more formally.
-- Add support for random input matrices.
-- Add cuBLAS-only benchmark mode for large matrix sizes.
-- Add plots for GFLOPS vs matrix size.
+- 📈 Add CSV export.
+- 🔬 Add Nsight Compute profiling notes.
+- 📊 Compare tile sizes `16 x 16` and `32 x 32` more formally.
+- 🧪 Add support for random input matrices.
+- ⚡ Add cuBLAS-only benchmark mode for large matrix sizes.
+- 📉 Add plots for GFLOPS vs matrix size.
 
 ---
 
-## Lessons Learned
+## Lessons Learned 💡
 
 This project demonstrates several important CUDA performance ideas:
 
