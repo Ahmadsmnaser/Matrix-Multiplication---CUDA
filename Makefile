@@ -1,19 +1,23 @@
-PROJECT := matrix-multiplication-cuda
+NVCC := nvcc
+CXXFLAGS := -O2 -std=c++14
+INCLUDES := -Iinclude
+LDFLAGS := -lcublas
 
-.PHONY: help tree clean
+TARGET := src/cuda/MM
+SOURCES := src/cuda/matmul.cu src/cuda/matmul_kernels.cu src/cpu/matmul.cpp
+
+.PHONY: all help tree clean
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCES) include/matmul_cpu.hpp include/matmul_kernels.cuh
+	$(NVCC) $(CXXFLAGS) $(INCLUDES) $(SOURCES) $(LDFLAGS) -o $(TARGET)
 
 help:
-	@printf "Project: $(PROJECT)\n\n"
-	@printf "Current status: structure only, no implementation yet.\n\n"
-	@printf "Planned layout:\n"
-	@printf "  include/        Public headers\n"
-	@printf "  src/cpu/        CPU baseline implementation\n"
-	@printf "  src/cuda/       CUDA kernels and wrappers\n"
-	@printf "  src/common/     Shared utilities\n"
-	@printf "  benchmarks/     Timing and GFLOPS benchmarks\n"
-	@printf "  tests/          Correctness tests\n"
-	@printf "  docs/           Notes, results, profiling\n\n"
-	@printf "Next step: add the CPU baseline in src/cpu/ and a matching header in include/.\n"
+	@printf "Targets:\n"
+	@printf "  make        Build the CUDA benchmark\n"
+	@printf "  make clean  Remove generated binaries\n"
+	@printf "  make tree   Print the project layout\n"
 
 tree:
 	@printf ".\n"
@@ -29,4 +33,4 @@ tree:
 	@printf "`-- tests/\n"
 
 clean:
-	@printf "Nothing to clean yet.\n"
+	rm -f $(TARGET)

@@ -6,127 +6,8 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#define TILE_SIZE 32
-
-enum KernelType
-{
-    NAIVE,
-    TILED,
-    CUBLAS
-};
-
-__global__ void naive_matmul_kernel(const float *A, const float *B, float *C, int N)
-{
-    // Each thread computes one element C[row][col].
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // Bounds check for matrix sizes not divisible by block size.
-    if (row < N && col < N)
-    {
-        float value = 0.0f;
-
-        for (int k = 0; k < N; k++)
-        {
-            value += A[row * N + k] * B[k * N + col];
-        }
-
-        C[row * N + col] = value;
-    }
-}
-
-__global__ void tiled_matmul_kernel(const float *A, const float *B, float *C, int N)
-{
-    // Shared memory tiles for A and B.
-    __shared__ float tileA[TILE_SIZE][TILE_SIZE];
-    __shared__ float tileB[TILE_SIZE][TILE_SIZE];
-
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
-
-    float value = 0.0f;
-
-    int numTiles = (N + TILE_SIZE - 1) / TILE_SIZE;
-
-    for (int t = 0; t < numTiles; t++)
-    {
-        int tiledColA = t * TILE_SIZE + threadIdx.x;
-        int tiledRowB = t * TILE_SIZE + threadIdx.y;
-
-        // Load one tile from A into shared memory.
-        if (row < N && tiledColA < N)
-        {
-            tileA[threadIdx.y][threadIdx.x] = A[row * N + tiledColA];
-        }
-        else
-        {
-            tileA[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-
-        // Load one tile from B into shared memory.
-        if (tiledRowB < N && col < N)
-        {
-            tileB[threadIdx.y][threadIdx.x] = B[tiledRowB * N + col];
-        }
-        else
-        {
-            tileB[threadIdx.y][threadIdx.x] = 0.0f;
-        }
-
-        __syncthreads();
-
-        // Compute partial dot product for this tile.
-        for (int k = 0; k < TILE_SIZE; k++)
-        {
-            value += tileA[threadIdx.y][k] * tileB[k][threadIdx.x];
-        }
-
-        __syncthreads();
-    }
-
-    if (row < N && col < N)
-    {
-        C[row * N + col] = value;
-    }
-}
-
-void cpu_matmul(const std::vector<float> &A,
-                const std::vector<float> &B,
-                std::vector<float> &C,
-                int N)
-{
-    // CPU reference implementation for correctness checking.
-    for (int row = 0; row < N; row++)
-    {
-        for (int col = 0; col < N; col++)
-        {
-            float value = 0.0f;
-
-            for (int k = 0; k < N; k++)
-            {
-                value += A[row * N + k] * B[k * N + col];
-            }
-
-            C[row * N + col] = value;
-        }
-    }
-}
-
-void print_matrix(const std::vector<float> &M, int N, const char *name)
-{
-    std::cout << name << ":\n";
-
-    for (int row = 0; row < N; row++)
-    {
-        for (int col = 0; col < N; col++)
-        {
-            std::cout << M[row * N + col] << " ";
-        }
-        std::cout << "\n";
-    }
-
-    std::cout << "\n";
-}
+#include "matmul_cpu.hpp"
+#include "matmul_kernels.cuh"
 
 bool verify_result(const std::vector<float> &cpu,
                    const std::vector<float> &gpu,
@@ -147,30 +28,6 @@ bool verify_result(const std::vector<float> &cpu,
     return true;
 }
 
-bool launch_matmul_kernel(KernelType kernelType,
-                          dim3 gridSize,
-                          dim3 blockSize,
-                          const float *d_A,
-                          const float *d_B,
-                          float *d_C,
-                          int N)
-{
-    if (kernelType == NAIVE)
-    {
-        naive_matmul_kernel<<<gridSize, blockSize>>>(d_A, d_B, d_C, N);
-        return true;
-    }
-
-    if (kernelType == TILED)
-    {
-        tiled_matmul_kernel<<<gridSize, blockSize>>>(d_A, d_B, d_C, N);
-        return true;
-    }
-
-    std::cerr << "Unknown kernel type." << std::endl;
-    return false;
-}
-
 struct BenchmarkResult
 {
     const char *implementation;
@@ -183,46 +40,90 @@ struct BenchmarkResult
     bool verified;
 };
 
-bool run_benchmark(const char *implementation,
-                   KernelType kernelType,
-                   int N,
-                   int iterations,
-                   const dim3 &blockSize,
-                   BenchmarkResult &result)
+struct CpuReference
 {
-    std::vector<float> A(N * N);
-    std::vector<float> B(N * N);
-    std::vector<float> C_cpu(N * N, 0.0f);
-    std::vector<float> C_gpu(N * N, 0.0f);
+    std::vector<float> C;
+    double ms;
+    double gflops;
+};
 
-    // Deterministic initialization.
-    // With A=1 and B=1, every output element should equal N.
-    for (int i = 0; i < N * N; i++)
+struct DeviceBuffers
+{
+    float *A = nullptr;
+    float *B = nullptr;
+    float *C = nullptr;
+};
+
+double operation_count(int N)
+{
+    return 2.0 * static_cast<double>(N) * N * N;
+}
+
+double calculate_gflops(double ops, double ms)
+{
+    return ops / (ms / 1000.0) / 1e9;
+}
+
+void initialize_matrices(std::vector<float> &A, std::vector<float> &B)
+{
+    for (size_t i = 0; i < A.size(); i++)
     {
         A[i] = 1.0f;
         B[i] = 1.0f;
     }
+}
+
+CpuReference build_cpu_reference(const std::vector<float> &A,
+                                 const std::vector<float> &B,
+                                 int N,
+                                 double ops)
+{
+    CpuReference reference;
+    reference.C.assign(static_cast<size_t>(N) * N, 0.0f);
 
     auto cpuStart = std::chrono::high_resolution_clock::now();
-    cpu_matmul(A, B, C_cpu, N);
+    cpu_matmul(A, B, reference.C, N);
     auto cpuStop = std::chrono::high_resolution_clock::now();
 
     std::chrono::duration<double, std::milli> cpuElapsed = cpuStop - cpuStart;
-    double cpuMs = cpuElapsed.count();
+    reference.ms = cpuElapsed.count();
+    reference.gflops = calculate_gflops(ops, reference.ms);
 
-    double ops = 2.0 * static_cast<double>(N) * N * N;
-    double cpuSec = cpuMs / 1000.0;
-    double cpuGflops = ops / cpuSec / 1e9;
+    return reference;
+}
 
-    float *d_A = nullptr;
-    float *d_B = nullptr;
-    float *d_C = nullptr;
+void fill_result(BenchmarkResult &result,
+                 const char *implementation,
+                 int N,
+                 const CpuReference &reference,
+                 double gpuMs,
+                 double ops)
+{
+    result.implementation = implementation;
+    result.N = N;
+    result.cpuMs = reference.ms;
+    result.cpuGflops = reference.gflops;
+    result.gpuMs = gpuMs;
+    result.gpuGflops = calculate_gflops(ops, gpuMs);
+    result.speedup = reference.ms / gpuMs;
+}
 
-    size_t bytes = static_cast<size_t>(N) * N * sizeof(float);
+void free_device_buffers(DeviceBuffers &device)
+{
+    cudaFree(device.A);
+    cudaFree(device.B);
+    cudaFree(device.C);
+    device.A = nullptr;
+    device.B = nullptr;
+    device.C = nullptr;
+}
 
-    cudaError_t err;
-
-    err = cudaMalloc(&d_A, bytes);
+bool prepare_device_buffers(const std::vector<float> &A,
+                            const std::vector<float> &B,
+                            size_t bytes,
+                            DeviceBuffers &device)
+{
+    cudaError_t err = cudaMalloc(&device.A, bytes);
     if (err != cudaSuccess)
     {
         std::cerr << "Failed to allocate device memory for A: "
@@ -230,55 +131,75 @@ bool run_benchmark(const char *implementation,
         return false;
     }
 
-    err = cudaMalloc(&d_B, bytes);
+    err = cudaMalloc(&device.B, bytes);
     if (err != cudaSuccess)
     {
         std::cerr << "Failed to allocate device memory for B: "
                   << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_A);
+        free_device_buffers(device);
         return false;
     }
 
-    err = cudaMalloc(&d_C, bytes);
+    err = cudaMalloc(&device.C, bytes);
     if (err != cudaSuccess)
     {
         std::cerr << "Failed to allocate device memory for C: "
                   << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_A);
-        cudaFree(d_B);
+        free_device_buffers(device);
         return false;
     }
 
-    err = cudaMemcpy(d_A, A.data(), bytes, cudaMemcpyHostToDevice);
+    err = cudaMemcpy(device.A, A.data(), bytes, cudaMemcpyHostToDevice);
     if (err != cudaSuccess)
     {
         std::cerr << "Failed to copy A to device: "
                   << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
-    err = cudaMemcpy(d_B, B.data(), bytes, cudaMemcpyHostToDevice);
+    err = cudaMemcpy(device.B, B.data(), bytes, cudaMemcpyHostToDevice);
     if (err != cudaSuccess)
     {
         std::cerr << "Failed to copy B to device: "
                   << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
-    err = cudaMemset(d_C, 0, bytes);
+    err = cudaMemset(device.C, 0, bytes);
     if (err != cudaSuccess)
     {
         std::cerr << "Failed to initialize C on device: "
                   << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
+        return false;
+    }
+
+    return true;
+}
+
+bool run_benchmark(const char *implementation,
+                   KernelType kernelType,
+                   int N,
+                   int iterations,
+                   const dim3 &blockSize,
+                   BenchmarkResult &result)
+{
+    std::vector<float> A(static_cast<size_t>(N) * N);
+    std::vector<float> B(static_cast<size_t>(N) * N);
+    std::vector<float> C_gpu(static_cast<size_t>(N) * N, 0.0f);
+
+    initialize_matrices(A, B);
+
+    double ops = operation_count(N);
+    CpuReference reference = build_cpu_reference(A, B, N, ops);
+
+    size_t bytes = static_cast<size_t>(N) * N * sizeof(float);
+    DeviceBuffers device;
+
+    if (!prepare_device_buffers(A, B, bytes, device))
+    {
         return false;
     }
 
@@ -286,22 +207,18 @@ bool run_benchmark(const char *implementation,
                   (N + blockSize.y - 1) / blockSize.y);
 
     // Warm-up launch.
-    if (!launch_matmul_kernel(kernelType, gridSize, blockSize, d_A, d_B, d_C, N))
+    if (!launch_matmul_kernel(kernelType, gridSize, blockSize, device.A, device.B, device.C, N))
     {
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
-    err = cudaGetLastError();
+    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
     {
         std::cerr << "Warm-up kernel launch failed: "
                   << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
@@ -310,9 +227,7 @@ bool run_benchmark(const char *implementation,
     {
         std::cerr << "Warm-up kernel execution failed: "
                   << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
@@ -323,9 +238,7 @@ bool run_benchmark(const char *implementation,
     {
         std::cerr << "Failed to create start event: "
                   << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
@@ -335,9 +248,7 @@ bool run_benchmark(const char *implementation,
         std::cerr << "Failed to create stop event: "
                   << cudaGetErrorString(err) << std::endl;
         cudaEventDestroy(start);
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
@@ -348,21 +259,17 @@ bool run_benchmark(const char *implementation,
                   << cudaGetErrorString(err) << std::endl;
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
     for (int i = 0; i < iterations; i++)
     {
-        if (!launch_matmul_kernel(kernelType, gridSize, blockSize, d_A, d_B, d_C, N))
+        if (!launch_matmul_kernel(kernelType, gridSize, blockSize, device.A, device.B, device.C, N))
         {
             cudaEventDestroy(start);
             cudaEventDestroy(stop);
-            cudaFree(d_A);
-            cudaFree(d_B);
-            cudaFree(d_C);
+            free_device_buffers(device);
             return false;
         }
     }
@@ -374,9 +281,7 @@ bool run_benchmark(const char *implementation,
                   << cudaGetErrorString(err) << std::endl;
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
@@ -387,9 +292,7 @@ bool run_benchmark(const char *implementation,
                   << cudaGetErrorString(err) << std::endl;
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
@@ -400,9 +303,7 @@ bool run_benchmark(const char *implementation,
                   << cudaGetErrorString(err) << std::endl;
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
@@ -415,52 +316,28 @@ bool run_benchmark(const char *implementation,
                   << cudaGetErrorString(err) << std::endl;
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
     float avgMs = totalMs / iterations;
-    double gpuSec = avgMs / 1000.0;
-    double gpuGflops = ops / gpuSec / 1e9;
-    double speedup = cpuMs / avgMs;
-
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
-    err = cudaMemcpy(C_gpu.data(), d_C, bytes, cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(C_gpu.data(), device.C, bytes, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess)
     {
         std::cerr << "Failed to copy C from device: "
                   << cudaGetErrorString(err) << std::endl;
-        cudaFree(d_A);
-        cudaFree(d_B);
-        cudaFree(d_C);
+        free_device_buffers(device);
         return false;
     }
 
-    if (N <= 16)
-    {
-        print_matrix(A, N, "Matrix A");
-        print_matrix(B, N, "Matrix B");
-        print_matrix(C_cpu, N, "Matrix C_cpu");
-        print_matrix(C_gpu, N, "Matrix C_gpu");
-    }
+    bool verified = verify_result(reference.C, C_gpu);
 
-    bool verified = verify_result(C_cpu, C_gpu);
+    free_device_buffers(device);
 
-    cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
-
-    result.implementation = implementation;
-    result.N = N;
-    result.cpuMs = cpuMs;
-    result.cpuGflops = cpuGflops;
-    result.gpuMs = avgMs;
-    result.gpuGflops = gpuGflops;
-    result.speedup = speedup;
+    fill_result(result, implementation, N, reference, avgMs, ops);
     result.verified = verified;
 
     return true;
@@ -481,28 +358,14 @@ void print_result(const BenchmarkResult &result)
 }
 
 bool run_cublas_benchmark(int N, int iterations, BenchmarkResult &result){
-    std::vector<float> A(N * N);
-    std::vector<float> B(N * N);
-    std::vector<float> C_cpu(N * N, 0.0f);
-    std::vector<float> C_gpu(N * N, 0.0f);
+    std::vector<float> A(static_cast<size_t>(N) * N);
+    std::vector<float> B(static_cast<size_t>(N) * N);
+    std::vector<float> C_gpu(static_cast<size_t>(N) * N, 0.0f);
 
-    // Keep this initialization identical to the custom kernel benchmarks.
-    for (int i = 0; i < N * N; i++)
-    {
-        A[i] = 1.0f;
-        B[i] = 1.0f;
-    }
+    initialize_matrices(A, B);
 
-    auto cpuStart = std::chrono::high_resolution_clock::now();
-    cpu_matmul(A, B, C_cpu, N);
-    auto cpuStop = std::chrono::high_resolution_clock::now();
-
-    std::chrono::duration<double, std::milli> cpuElapsed = cpuStop - cpuStart;
-    double cpuMs = cpuElapsed.count();
-
-    double ops = 2.0 * static_cast<double>(N) * N * N;
-    double cpuSec = cpuMs / 1000.0;
-    double cpuGflops = ops / cpuSec / 1e9;
+    double ops = operation_count(N);
+    CpuReference reference = build_cpu_reference(A, B, N, ops);
 
     float *d_A = nullptr;
     float *d_B = nullptr;
@@ -724,10 +587,6 @@ bool run_cublas_benchmark(int N, int iterations, BenchmarkResult &result){
     }
 
     float avgMs = totalMs / iterations;
-    double gpuSec = avgMs / 1000.0;
-    double gpuGflops = ops / gpuSec / 1e9;
-    double speedup = cpuMs / avgMs;
-
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
@@ -743,20 +602,14 @@ bool run_cublas_benchmark(int N, int iterations, BenchmarkResult &result){
         return false;
     }
 
-    bool verified = verify_result(C_cpu, C_gpu);
+    bool verified = verify_result(reference.C, C_gpu);
 
     cublasDestroy(handle);
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
 
-    result.implementation = "cuBLAS";
-    result.N = N;
-    result.cpuMs = cpuMs;
-    result.cpuGflops = cpuGflops;
-    result.gpuMs = avgMs;
-    result.gpuGflops = gpuGflops;
-    result.speedup = speedup;
+    fill_result(result, "cuBLAS", N, reference, avgMs, ops);
     result.verified = verified;
 
     return true;

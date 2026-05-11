@@ -7,9 +7,6 @@ This repository is organized for a CPU-first implementation that will later grow
 - `include/` public headers
 - `src/cpu/` CPU baseline implementation
 - `src/cuda/` CUDA kernels and GPU-side code
-- `src/common/` shared helpers and utilities
-- `benchmarks/` timing and GFLOPS measurement programs
-- `tests/` correctness tests
 - `docs/` notes, profiling results, and project writeups
 
 ## Current Status
