@@ -3,6 +3,7 @@
 #include <cmath>
 #include <chrono>
 #include <iomanip>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #define TILE_SIZE 32
@@ -10,7 +11,8 @@
 enum KernelType
 {
     NAIVE,
-    TILED
+    TILED,
+    CUBLAS
 };
 
 __global__ void naive_matmul_kernel(const float *A, const float *B, float *C, int N)
@@ -478,8 +480,308 @@ void print_result(const BenchmarkResult &result)
               << "\n";
 }
 
+bool run_cublas_benchmark(int N, int iterations, BenchmarkResult &result){
+    std::vector<float> A(N * N);
+    std::vector<float> B(N * N);
+    std::vector<float> C_cpu(N * N, 0.0f);
+    std::vector<float> C_gpu(N * N, 0.0f);
+
+    // Keep this initialization identical to the custom kernel benchmarks.
+    for (int i = 0; i < N * N; i++)
+    {
+        A[i] = 1.0f;
+        B[i] = 1.0f;
+    }
+
+    auto cpuStart = std::chrono::high_resolution_clock::now();
+    cpu_matmul(A, B, C_cpu, N);
+    auto cpuStop = std::chrono::high_resolution_clock::now();
+
+    std::chrono::duration<double, std::milli> cpuElapsed = cpuStop - cpuStart;
+    double cpuMs = cpuElapsed.count();
+
+    double ops = 2.0 * static_cast<double>(N) * N * N;
+    double cpuSec = cpuMs / 1000.0;
+    double cpuGflops = ops / cpuSec / 1e9;
+
+    float *d_A = nullptr;
+    float *d_B = nullptr;
+    float *d_C = nullptr;
+
+    size_t bytes = static_cast<size_t>(N) * N * sizeof(float);
+
+    cudaError_t err = cudaMalloc(&d_A, bytes);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to allocate device memory for cuBLAS A: "
+                  << cudaGetErrorString(err) << std::endl;
+        return false;
+    }
+
+    err = cudaMalloc(&d_B, bytes);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to allocate device memory for cuBLAS B: "
+                  << cudaGetErrorString(err) << std::endl;
+        cudaFree(d_A);
+        return false;
+    }
+
+    err = cudaMalloc(&d_C, bytes);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to allocate device memory for cuBLAS C: "
+                  << cudaGetErrorString(err) << std::endl;
+        cudaFree(d_A);
+        cudaFree(d_B);
+        return false;
+    }
+
+    err = cudaMemcpy(d_A, A.data(), bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to copy cuBLAS A to device: "
+                  << cudaGetErrorString(err) << std::endl;
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    err = cudaMemcpy(d_B, B.data(), bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to copy cuBLAS B to device: "
+                  << cudaGetErrorString(err) << std::endl;
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    cublasHandle_t handle;
+    cublasStatus_t status = cublasCreate(&handle);
+    if (status != CUBLAS_STATUS_SUCCESS)
+    {
+        std::cerr << "Failed to create cuBLAS handle: " << status << std::endl;
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    // cuBLAS expects column-major matrices. Swapping A and B computes the
+    // correct result for our row-major memory layout: C = A * B.
+    status = cublasSgemm(handle,
+                         CUBLAS_OP_N,
+                         CUBLAS_OP_N,
+                         N,
+                         N,
+                         N,
+                         &alpha,
+                         d_B,
+                         N,
+                         d_A,
+                         N,
+                         &beta,
+                         d_C,
+                         N);
+    if (status != CUBLAS_STATUS_SUCCESS)
+    {
+        std::cerr << "cuBLAS warm-up failed: " << status << std::endl;
+        cublasDestroy(handle);
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess)
+    {
+        std::cerr << "cuBLAS warm-up execution failed: "
+                  << cudaGetErrorString(err) << std::endl;
+        cublasDestroy(handle);
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    cudaEvent_t start, stop;
+    err = cudaEventCreate(&start);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to create cuBLAS start event: "
+                  << cudaGetErrorString(err) << std::endl;
+        cublasDestroy(handle);
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    err = cudaEventCreate(&stop);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to create cuBLAS stop event: "
+                  << cudaGetErrorString(err) << std::endl;
+        cudaEventDestroy(start);
+        cublasDestroy(handle);
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    err = cudaEventRecord(start);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to record cuBLAS start event: "
+                  << cudaGetErrorString(err) << std::endl;
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        cublasDestroy(handle);
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    for (int i = 0; i < iterations; i++)
+    {
+        status = cublasSgemm(handle,
+                             CUBLAS_OP_N,
+                             CUBLAS_OP_N,
+                             N,
+                             N,
+                             N,
+                             &alpha,
+                             d_B,
+                             N,
+                             d_A,
+                             N,
+                             &beta,
+                             d_C,
+                             N);
+        if (status != CUBLAS_STATUS_SUCCESS)
+        {
+            std::cerr << "cuBLAS benchmark call failed: " << status << std::endl;
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            cublasDestroy(handle);
+            cudaFree(d_A);
+            cudaFree(d_B);
+            cudaFree(d_C);
+            return false;
+        }
+    }
+
+    err = cudaEventRecord(stop);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to record cuBLAS stop event: "
+                  << cudaGetErrorString(err) << std::endl;
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        cublasDestroy(handle);
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    err = cudaEventSynchronize(stop);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to synchronize cuBLAS stop event: "
+                  << cudaGetErrorString(err) << std::endl;
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        cublasDestroy(handle);
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    float totalMs = 0.0f;
+    err = cudaEventElapsedTime(&totalMs, start, stop);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to get cuBLAS elapsed time: "
+                  << cudaGetErrorString(err) << std::endl;
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        cublasDestroy(handle);
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    float avgMs = totalMs / iterations;
+    double gpuSec = avgMs / 1000.0;
+    double gpuGflops = ops / gpuSec / 1e9;
+    double speedup = cpuMs / avgMs;
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    err = cudaMemcpy(C_gpu.data(), d_C, bytes, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "Failed to copy cuBLAS C from device: "
+                  << cudaGetErrorString(err) << std::endl;
+        cublasDestroy(handle);
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+        return false;
+    }
+
+    bool verified = verify_result(C_cpu, C_gpu);
+
+    cublasDestroy(handle);
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+
+    result.implementation = "cuBLAS";
+    result.N = N;
+    result.cpuMs = cpuMs;
+    result.cpuGflops = cpuGflops;
+    result.gpuMs = avgMs;
+    result.gpuGflops = gpuGflops;
+    result.speedup = speedup;
+    result.verified = verified;
+
+    return true;
+}
+
 int main()
 {
+    int deviceCount = 0;
+    cudaError_t err = cudaGetDeviceCount(&deviceCount);
+
+    if (err != cudaSuccess)
+    {
+        std::cerr << "cudaGetDeviceCount failed: "
+                  << cudaGetErrorString(err) << std::endl;
+        return -1;
+    }
+
+    std::cout << "CUDA Device Count: " << deviceCount << "\n";
+
+    if (deviceCount == 0)
+    {
+        std::cerr << "No CUDA-capable GPU found.\n";
+        return -1;
+    }
+
     const int sizes[] = {256, 512, 1024};
     const int numSizes = sizeof(sizes) / sizeof(sizes[0]);
     const int iterations = 10;
@@ -515,6 +817,13 @@ int main()
             return -1;
         }
         print_result(tiledResult);
+
+        BenchmarkResult cublasResult{};
+        if (!run_cublas_benchmark(sizes[i], iterations, cublasResult))
+        {
+            return -1;
+        }
+        print_result(cublasResult);
     }
 
     return 0;
